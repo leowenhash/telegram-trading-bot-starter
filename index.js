@@ -2,12 +2,16 @@ require('dotenv').config({ path: '.env.local' });
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 const { PrivyClient } = require('@privy-io/server-auth');
-const { PublicKey, VersionedTransaction } = require('@solana/web3.js');
+const { PublicKey, VersionedTransaction, TransactionMessage, SystemProgram, LAMPORTS_PER_SOL} = require('@solana/web3.js');
 const { getAllUserWallets, saveUserWallet } = require('./mockDb');
 const { getJupiterUltraOrder, executeJupiterUltraOrder, getJupiterUltraBalances, SOL_MINT } = require('./jupiter');
+const SolanaService = require('./solana');
+
+// Initialize Solana service
+const solana = new SolanaService();
 
 const app = express();
-const port = process.env.PORT || 3001;
+const port = process.env.PORT || 3003;
 
 // Initialize Privy client
 const privy = new PrivyClient(process.env.PRIVY_APP_ID, process.env.PRIVY_APP_SECRET, {
@@ -108,7 +112,10 @@ bot.onText(/\/start/, async (msg) => {
       `Your wallet address is: ${walletAddress}\n\n` +
       `You can use the following commands:\n` +
       `/getwallet - View your wallet balance\n` +
-      `/swap <token_address> <amount> - Swap SOL for another token\n\n` +
+      `/swap <token_address> <amount> - Swap SOL for another token\n` +
+      `/balance - Check your SOL balance\n` +
+      `/transactions - View your recent transactions\n` +
+      `/transfer <address> <amount> - Transfer SOL to another address\n\n` +
       `Example: /swap EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 0.1`
     );
   } catch (error) {
@@ -341,7 +348,160 @@ bot.onText(/^\/swap$/, (msg) => {
   );
 });
 
+/**
+ * Handles the /balance command to display a user's SOL balance
+ * @param {Object} msg - Telegram message object
+ */
+bot.onText(/\/balance/, async (msg) => {
+  const userId = msg.from.id;
+  console.log(`Processing /balance command for user ${userId}`);
+  
+  const userWallets = getAllUserWallets();
+  
+  if (!userWallets[userId]) {
+    return bot.sendMessage(
+      msg.chat.id,
+      '❌ You don\'t have a wallet yet. Use /start to create one.'
+    );
+  }
+
+  try {
+    const walletId = userWallets[userId];
+    const wallet = await privy.walletApi.getWallet({id: walletId});
+    const balance = await solana.getBalance(wallet.address);
+    
+    bot.sendMessage(
+      msg.chat.id,
+      `💰 Your SOL balance: ${balance.toFixed(4)} SOL`
+    );
+  } catch (error) {
+    console.error('Error getting balance:', error);
+    bot.sendMessage(
+      msg.chat.id,
+      '❌ Sorry, there was an error checking your balance. Please try again later.'
+    );
+  }
+});
+
+/**
+ * Handles the /transactions command to display a user's recent transactions
+ * @param {Object} msg - Telegram message object
+ */
+bot.onText(/\/transactions/, async (msg) => {
+  const userId = msg.from.id;
+  console.log(`Processing /transactions command for user ${userId}`);
+  
+  const userWallets = getAllUserWallets();
+  
+  if (!userWallets[userId]) {
+    return bot.sendMessage(
+      msg.chat.id,
+      '❌ You don\'t have a wallet yet. Use /start to create one.'
+    );
+  }
+
+  try {
+    const walletId = userWallets[userId];
+    const wallet = await privy.walletApi.getWallet({id: walletId});
+    const transactions = await solana.getTransactions(wallet.address);
+    
+    let message = `📜 Recent transactions:\n\n`;
+    transactions.forEach(tx => {
+      const amount = tx.amount / LAMPORTS_PER_SOL;
+      const formattedAmount = amount >= 0 ? 
+        `+${amount.toFixed(4)}` : 
+        `${amount.toFixed(4)}`;
+      
+      message += `⏰ ${new Date(tx.blockTime * 1000).toLocaleString()}\n`;
+      message += `🆔 ${tx.signature}\n`;
+      message += `💸 Amount: ${formattedAmount} SOL\n\n`;
+    });
+
+    bot.sendMessage(msg.chat.id, message);
+  } catch (error) {
+    console.error('Error getting transactions:', error);
+    bot.sendMessage(
+      msg.chat.id,
+      '❌ Sorry, there was an error fetching your transactions. Please try again later.'
+    );
+  }
+});
+
+/**
+ * Handles the /transfer command to transfer SOL to another address
+ * @param {Object} msg - Telegram message object
+ * @param {Array} match - Regex match groups
+ */
+bot.onText(/\/transfer (.+) (.+)/, async (msg, match) => {
+  const userId = msg.from.id;
+  const toAddress = match[1];
+  const amount = parseFloat(match[2]);
+
+  console.log(`Processing /transfer command for user ${userId}: ${amount} SOL to ${toAddress}`);
+
+  const userWallets = getAllUserWallets();
+  
+  if (!userWallets[userId]) {
+    return bot.sendMessage(
+      msg.chat.id,
+      '❌ Please use /start first to create a wallet.'
+    );
+  }
+
+  // Validate amount
+  if (isNaN(amount) || amount <= 0) {
+    return bot.sendMessage(
+      msg.chat.id,
+      '❌ Please enter a valid amount of SOL (e.g., 0.1, 0.5, 1.0)'
+    );
+  }
+
+  try {
+    const walletId = userWallets[userId];
+    const wallet = await privy.walletApi.getWallet({id: walletId});
+    
+    // Create transfer instruction
+    const transferInstruction = SystemProgram.transfer({
+      fromPubkey: new PublicKey(wallet.address),
+      toPubkey: new PublicKey(toAddress),
+      lamports: amount * LAMPORTS_PER_SOL,
+    });
+
+    // Create transaction message
+    const messageV0 = new TransactionMessage({
+      payerKey: new PublicKey(wallet.address),
+      recentBlockhash: (await solana.connection.getRecentBlockhash()).blockhash,
+      instructions: [transferInstruction]
+    }).compileToV0Message();
+
+    // Create versioned transaction
+    const transaction = new VersionedTransaction(messageV0);
+
+    // Sign transaction via Privy
+    const { signedTransaction } = await privy.walletApi.solana.signTransaction({
+      walletId,
+      transaction
+    });
+
+    // Send transaction
+    const signature = await solana.connection.sendRawTransaction(signedTransaction.serialize());
+    
+    bot.sendMessage(
+      msg.chat.id,
+      `✅ Transfer successful!\n\n` +
+      `Transaction: https://solscan.io/tx/${signature}\n` +
+      `Sent ${amount} SOL to ${toAddress}`
+    );
+  } catch (error) {
+    console.error('Transfer error:', error);
+    bot.sendMessage(
+      msg.chat.id,
+      '❌ Sorry, there was an error processing your transfer. Please try again later.'
+    );
+  }
+});
+
 // Start the server
 app.listen(port, () => {
   console.log(`Server is running on port ${port}`);
-}); 
+});
