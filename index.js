@@ -2,13 +2,17 @@ require('dotenv').config({ path: '.env.local' });
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 const { PrivyClient } = require('@privy-io/server-auth');
-const { PublicKey, VersionedTransaction, TransactionMessage, SystemProgram, LAMPORTS_PER_SOL} = require('@solana/web3.js');
+const { PublicKey, VersionedTransaction, TransactionMessage, SystemProgram, LAMPORTS_PER_SOL, Keypair } = require('@solana/web3.js');
+const { getAssociatedTokenAddress, createTransferInstruction } = require('@solana/spl-token');
 const { getAllUserWallets, saveUserWallet } = require('./mockDb');
 const { getJupiterUltraOrder, executeJupiterUltraOrder, getJupiterUltraBalances, SOL_MINT } = require('./jupiter');
 const SolanaService = require('./solana');
+const MeteoraService = require('./meteora');
+const { BN } = require('bn.js');
 
-// Initialize Solana service
+// Initialize services
 const solana = new SolanaService();
+const meteora = new MeteoraService(solana.connection);
 
 const app = express();
 const port = process.env.PORT || 3003;
@@ -115,8 +119,11 @@ bot.onText(/\/start/, async (msg) => {
       `/swap <token_address> <amount> - Swap SOL for another token\n` +
       `/balance - Check your SOL balance\n` +
       `/transactions - View your recent transactions\n` +
-      `/transfer <address> <amount> - Transfer SOL to another address\n\n` +
-      `Example: /swap EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 0.1`
+      `/transfer <address> <amount> - Transfer SOL to another address\n` +
+      `/transfertoken <address> <token_mint> <amount> - Transfer tokens to another address\n` +
+      `/createposition <pool_address> <type> <amount> - Create position (balance/imbalance/one-side)\n\n` +
+      `Example: /swap EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 0.1\n` +
+      `Example: /transfertoken <address> EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 10`
     );
   } catch (error) {
     console.error(`Error fetching wallet for user ${userId}:`, error);
@@ -160,8 +167,8 @@ bot.onText(/\/getwallet/, async (msg) => {
     
     console.log(`Fetching balances for wallet ${walletAddress}`);
     
-    // Get current token balances using Jupiter Ultra API
-    const balances = await getJupiterUltraBalances(walletAddress);
+    // Get all token balances
+    const balances = await solana.getAllTokenBalances(walletAddress);
     
     // Format the balance message
     let balanceMessage = `💰 Wallet Balance:\n\n`;
@@ -170,7 +177,11 @@ bot.onText(/\/getwallet/, async (msg) => {
     for (const [token, balance] of Object.entries(balances)) {
       if (balance.amount !== "0") {
         hasBalance = true;
-        balanceMessage += `${token}: ${balance.uiAmount.toFixed(4)}\n`;
+        const tokenDisplay = token === 'SOL' ? 'SOL' : 
+                          balance.symbol || `${token.slice(0, 4)}...${token.slice(-4)}`;
+        const formattedAmount = balance.uiAmount.toFixed(4) + 
+                              (token === 'SOL' ? ' SOL' : '');
+        balanceMessage += `${tokenDisplay}: ${formattedAmount}\n`;
       }
     }
     
@@ -432,6 +443,239 @@ bot.onText(/\/transactions/, async (msg) => {
  * @param {Object} msg - Telegram message object
  * @param {Array} match - Regex match groups
  */
+/**
+ * Handles the /transfertoken command to transfer tokens to another address
+ * @param {Object} msg - Telegram message object
+ * @param {Array} match - Regex match groups
+ */
+bot.onText(/\/transfertoken (.+) (.+) (.+)/, async (msg, match) => {
+  const userId = msg.from.id;
+  const toAddress = match[1];
+  const tokenMint = match[2];
+  const amount = parseFloat(match[3]);
+
+  console.log(`Processing /transfertoken command for user ${userId}: ${amount} tokens (${tokenMint}) to ${toAddress}`);
+
+  const userWallets = getAllUserWallets();
+  
+  if (!userWallets[userId]) {
+    return bot.sendMessage(
+      msg.chat.id,
+      '❌ Please use /start first to create a wallet.'
+    );
+  }
+
+  // Validate parameters
+  if (!toAddress || !tokenMint || !amount) {
+    return bot.sendMessage(
+      msg.chat.id,
+      '❌ Missing parameters. Usage: /transfertoken <address> <token_mint> <amount>\n' +
+      'Example: /transfertoken Hq5eXj... AqeS6f... 15000'
+    );
+  }
+
+  // Validate token mint
+  try {
+    new PublicKey(tokenMint);
+  } catch (error) {
+    return bot.sendMessage(
+      msg.chat.id,
+      '❌ Invalid token address. Please enter a valid Solana token address.\n' +
+      'Example: AqeS6fGiUcALqEgWST8WvyjfksSpnXmUhxgZHSn8Pg9x'
+    );
+  }
+
+  // Validate amount
+  if (isNaN(amount) || amount <= 0) {
+    return bot.sendMessage(
+      msg.chat.id,
+      '❌ Please enter a valid amount of tokens (must be greater than 0)'
+    );
+  }
+
+  // Validate to address
+  try {
+    new PublicKey(toAddress);
+  } catch (error) {
+    return bot.sendMessage(
+      msg.chat.id,
+      '❌ Invalid recipient address. Please enter a valid Solana address.'
+    );
+  }
+
+  try {
+    const walletId = userWallets[userId];
+    const wallet = await privy.walletApi.getWallet({id: walletId});
+    
+    // Get token accounts
+    const fromTokenAccount = await getAssociatedTokenAddress(
+      new PublicKey(tokenMint),
+      new PublicKey(wallet.address)
+    );
+    const toTokenAccount = await getAssociatedTokenAddress(
+      new PublicKey(tokenMint),
+      new PublicKey(toAddress)
+    );
+
+    // 获取代币小数位数
+    const tokenInfo = await solana.connection.getParsedAccountInfo(new PublicKey(tokenMint));
+    const decimals = tokenInfo?.value?.data?.parsed?.info?.decimals || 9;
+    const amountInLamports = Math.floor(amount * Math.pow(10, decimals));
+
+    // Check token balance
+    const tokenBalanceRaw = await solana.getTokenBalance(wallet.address, tokenMint);
+    const tokenBalance = parseFloat(tokenBalanceRaw) / Math.pow(10, decimals);
+    
+    if (tokenBalance < amount) {
+      return bot.sendMessage(
+        msg.chat.id,
+        `❌ Insufficient token balance.\n` +
+        `You have ${tokenBalance} tokens but need ${amount} for this transfer.\n` +
+        `Use /getwallet to check your balances.`
+      );
+    }
+
+    // Create transfer instruction
+    const transferInstruction = createTransferInstruction(
+      fromTokenAccount,
+      toTokenAccount,
+      new PublicKey(wallet.address),
+      amountInLamports
+    );
+
+    // Create transaction message
+    const messageV0 = new TransactionMessage({
+      payerKey: new PublicKey(wallet.address),
+      recentBlockhash: (await solana.connection.getRecentBlockhash()).blockhash,
+      instructions: [transferInstruction]
+    }).compileToV0Message();
+
+    // Create versioned transaction
+    const transaction = new VersionedTransaction(messageV0);
+
+    // Sign transaction via Privy
+    const { signedTransaction } = await privy.walletApi.solana.signTransaction({
+      walletId,
+      transaction
+    });
+
+    // Send token transfer
+    const signature = await solana.transferToken(
+      wallet.address,
+      toAddress,
+      tokenMint,
+      amount,
+      signedTransaction.serialize()
+    );
+    
+    bot.sendMessage(
+      msg.chat.id,
+      `✅ Token transfer successful!\n\n` +
+      `Transaction: https://solscan.io/tx/${signature}\n` +
+      `Sent ${amount} tokens (${tokenMint}) to ${toAddress}`
+    );
+  } catch (error) {
+    console.error('Token transfer error:', error);
+    bot.sendMessage(
+      msg.chat.id,
+      '❌ Sorry, there was an error processing your token transfer. Please try again later.'
+    );
+  }
+});
+
+// Store user state for interactive commands
+const userState = {};
+
+bot.onText(/\/createposition (.+) (.+) (.+)/, async (msg, match) => {
+  const userId = msg.from.id;
+  const positionType = match[1].toLowerCase();
+  const poolAddress = match[2];
+  const amount = parseFloat(match[3]);
+
+  // Validate position type
+  if (!['balance', 'imbalance', 'one-side'].includes(positionType)) {
+    return bot.sendMessage(msg.chat.id, '❌ Invalid type, must be balance/imbalance/one-side');
+  }
+
+  // Validate pool address
+  try {
+    new PublicKey(poolAddress);
+  } catch (error) {
+    return bot.sendMessage(msg.chat.id, '❌ Invalid pool address');
+  }
+
+  // Validate amount
+  if (isNaN(amount) || amount <= 0) {
+    return bot.sendMessage(msg.chat.id, '❌ Invalid amount, must be number > 0');
+  }
+
+  // Get user wallet
+  const userWallets = getAllUserWallets();
+  if (!userWallets[userId]) {
+    return bot.sendMessage(msg.chat.id, '❌ Please use /start to create a wallet first');
+  }
+
+  try {
+    const walletId = userWallets[userId];
+    const wallet = await privy.walletApi.getWallet({id: walletId});
+    const walletAddress = wallet.address;
+
+    // Create position
+    const dlmmPool = await meteora.createDlmmPool(poolAddress);
+    const amountInLamports = Math.floor(amount * 1e9);
+
+    let transaction;
+    switch (positionType) {
+      case 'balance':
+        transaction = await meteora.createBalancePosition(dlmmPool, walletAddress, amountInLamports);
+        break;
+      case 'imbalance':
+        transaction = await meteora.createImbalancePosition(dlmmPool, walletAddress, amountInLamports, amountInLamports/2);
+        break;
+      case 'one-side':
+        transaction = await meteora.createOneSidePosition(dlmmPool, walletAddress, amountInLamports);
+        break;
+    }
+
+    const { signedTransaction } = await privy.walletApi.solana.signTransaction({
+      walletId,
+      transaction
+    });
+
+    const signature = await solana.connection.sendRawTransaction(signedTransaction.serialize(), {
+      skipPreflight: false,
+      preflightCommitment: 'confirmed'
+    });
+    
+    bot.sendMessage(
+      msg.chat.id,
+      `✅ Position created successfully!\n\n` +
+      `Type: ${positionType}\n` +
+      `Amount: ${amount}\n` +
+      `Pool: ${poolAddress}\n` +
+      `Transaction: https://solscan.io/tx/${signature}`
+    );
+  } catch (error) {
+    console.error('Create position error:', error);
+    bot.sendMessage(
+      msg.chat.id,
+      `❌ Error creating position: ${error.message}`
+    );
+  }
+});
+
+// Help message for /createposition
+bot.onText(/^\/createposition$/, (msg) => {
+  bot.sendMessage(
+    msg.chat.id,
+    '❌ Missing parameters. Usage:\n' +
+    '/createposition <type> <pool> <amount>\n\n' +
+    'Example:\n' +
+    '/createposition balance NPLipchco8sZA4jSR47dVafy77PdbpBCfqPf8Ksvsvj 100\n\n' +
+    'Available types: balance, imbalance, one-side'
+  );
+});
+
 bot.onText(/\/transfer (.+) (.+)/, async (msg, match) => {
   const userId = msg.from.id;
   const toAddress = match[1];
