@@ -1,90 +1,57 @@
-import { PublicKey, Keypair, Connection, VersionedTransaction } from '@solana/web3.js';
+import { PublicKey, Keypair, Connection, VersionedTransaction, Transaction, Cluster } from '@solana/web3.js';
 import { BN } from 'bn.js';
 import DLMM, { autoFillYByStrategy, StrategyType } from '@meteora-ag/dlmm';
+import type { LbPosition } from '@meteora-ag/dlmm';
 import dotenv from 'dotenv';
 dotenv.config({ path: '.env' });
 
 // 网络到RPC的映射
-const NETWORK_TO_RPC = {
-  devnet: 'https://api.devnet.solana.com',
-  testnet: 'https://api.testnet.solana.com',
-  mainnet: 'https://api.mainnet-beta.solana.com'
+const NETWORK_TO_RPC: Record<string, string> = {
+  devnet: process.env.DEVNET_RPC || 'https://api.devnet.solana.com',
+  testnet: process.env.TESTNET_RPC || 'https://api.testnet.solana.com',
+  mainnet: process.env.MAINNET_RPC || 'https://api.mainnet-beta.solana.com'
 };
 
-class MeteoraService {
-  connection: Connection;
-  rpcUrl: string;
+export class MeteoraService {
+  private connection: Connection;
+  private dlmmPool?: DLMM;
+  private poolAddress: PublicKey;
+  private network: Cluster;
 
-  /**
-   * 创建Meteora服务实例
-   * @param {Connection|string} [connection] - 可选的Solana连接实例或RPC URL字符串
-   */
-  constructor(connection?: Connection | string) {
-    const network = process.env.SOLANA_NETWORK as keyof typeof NETWORK_TO_RPC || 'devnet';
-    const rpcUrl = NETWORK_TO_RPC[network] || NETWORK_TO_RPC.devnet;
-    
-    if (connection) {
-      if (typeof connection === 'string') {
-        this.connection = new Connection(connection, 'confirmed');
-        this.rpcUrl = connection;
-      } else {
-        this.connection = connection;
-        this.rpcUrl = connection.rpcEndpoint;
-      }
-    } else {
-      this.connection = new Connection(rpcUrl, 'confirmed');
-      this.rpcUrl = rpcUrl;
+  constructor(connection: Connection, poolAddress: string, network: Cluster = process.env.NETWORK as Cluster || 'devnet') {
+    if (!NETWORK_TO_RPC[network]) {
+      throw new Error(`不支持的网络类型: ${network}`);
     }
     
-    console.log(`Using RPC: ${this.rpcUrl}`);
+    this.connection = connection;
+    this.poolAddress = new PublicKey(poolAddress);
+    this.network = network;
   }
 
-  /**
-   * Creates a DLMM pool instance
-   * @param {string} poolAddress - Pool address
-   * @returns {Promise<DLMM>} DLMM instance
-   * @throws {Error} If connection is not established or pool address is invalid
-   */
-  async createDlmmPool(poolAddress: string): Promise<InstanceType<typeof DLMM>> {
-    if (!this.connection) {
-      throw new Error('Solana connection not established');
+  async initDLMMPool(): Promise<DLMM> {
+    if (!this.dlmmPool) {
+      this.dlmmPool = await DLMM.create(this.connection, this.poolAddress);
+      console.log(`✅ DLMM 池创建成功 (网络: ${this.network})`);
     }
-    
-    try {
-      const publicKey = new PublicKey(poolAddress);
-      console.log(`Creating DLMM pool with address: ${poolAddress}`);
-      const dlmm = await DLMM.create(this.connection, publicKey);
-      console.log('DLMM pool created successfully');
-      return dlmm;
-    } catch (error: unknown) {
-      const errMsg = error instanceof Error ? error.message : 'Unknown error';
-      console.error(`Failed to create DLMM pool: ${errMsg}`);
-      throw new Error(`Invalid pool address or DLMM initialization failed: ${errMsg}`);
-    }
+    return this.dlmmPool;
   }
 
-  /**
-   * 创建平衡仓位
-   * @param {DLMM} dlmmPool - DLMM池实例
-   * @param {string} userPubkey - 用户公钥
-   * @param {number} totalXAmount - X代币数量
-   * @param {number} rangeInterval - 区间范围
-   * @returns {Promise<Object>} 交易结果
-   */
-  async createBalancePosition(
-    dlmmPool: InstanceType<typeof DLMM>,
-    userPubkey: string,
-    totalXAmount: number,
-    rangeInterval = 10
-  ): Promise<VersionedTransaction> {
+  async listPositions(userPubkey: string): Promise<LbPosition[]> {
+    const dlmmPool = await this.initDLMMPool();
+    const { userPositions } = await dlmmPool.getPositionsByUserAndLbPair(new PublicKey(userPubkey));
+    return userPositions;
+  }
+
+  async createBalancePosition(userPubkey: string, amount: number, positionKeypair?: Keypair) {
+    const dlmmPool = await this.initDLMMPool();
     const activeBin = await dlmmPool.getActiveBin();
-    const minBinId = activeBin.binId - rangeInterval;
-    const maxBinId = activeBin.binId + rangeInterval;
+    const minBinId = activeBin.binId - 10;
+    const maxBinId = activeBin.binId + 10;
 
     const totalYAmount = autoFillYByStrategy(
       activeBin.binId,
-      (dlmmPool as any).lbPair.binStep as number,
-      new BN(totalXAmount),
+      (dlmmPool as any).lbPair.binStep,
+      new BN(amount),
       activeBin.xAmount,
       activeBin.yAmount,
       minBinId,
@@ -92,10 +59,12 @@ class MeteoraService {
       StrategyType.Spot
     );
 
+    positionKeypair = positionKeypair || Keypair.generate();
+
     const tx = await dlmmPool.initializePositionAndAddLiquidityByStrategy({
-      positionPubKey: new PublicKey(userPubkey), // 使用用户钱包地址作为仓位地址
+      positionPubKey: positionKeypair.publicKey,
       user: new PublicKey(userPubkey),
-      totalXAmount: new BN(totalXAmount),
+      totalXAmount: new BN(amount),
       totalYAmount,
       strategy: {
         maxBinId,
@@ -103,67 +72,53 @@ class MeteoraService {
         strategyType: StrategyType.Spot
       }
     });
-    const serializedTx = tx.serialize();
-    return VersionedTransaction.deserialize(serializedTx);
+
+    console.log('✅ 交易构造完成');
+
+    return {
+      transaction: Array.isArray(tx) ? tx[0] : tx,
+      positionKeypair
+    };
   }
 
-  /**
-   * 创建不平衡仓位
-   * @param {DLMM} dlmmPool - DLMM池实例
-   * @param {string} userPubkey - 用户公钥
-   * @param {number} totalXAmount - X代币数量
-   * @param {number} totalYAmount - Y代币数量
-   * @param {number} rangeInterval - 区间范围
-   * @returns {Promise<Object>} 交易结果
-   */
-  async createImbalancePosition(
-    dlmmPool: InstanceType<typeof DLMM>,
-    userPubkey: string,
-    totalXAmount: number,
-    totalYAmount: number,
-    rangeInterval = 10
-  ): Promise<VersionedTransaction> {
+  async createImbalancePosition(userPubkey: string, xAmount: number, yAmount: number) {
+    const dlmmPool = await this.initDLMMPool();
     const activeBin = await dlmmPool.getActiveBin();
-    const minBinId = activeBin.binId - rangeInterval;
-    const maxBinId = activeBin.binId + rangeInterval;
+    const minBinId = activeBin.binId - 10;
+    const maxBinId = activeBin.binId + 10;
+
+    const positionKeypair = Keypair.generate();
 
     const tx = await dlmmPool.initializePositionAndAddLiquidityByStrategy({
-      positionPubKey: new PublicKey(userPubkey), // 使用用户钱包地址作为仓位地址
+      positionPubKey: positionKeypair.publicKey,
       user: new PublicKey(userPubkey),
-      totalXAmount: new BN(totalXAmount),
-      totalYAmount: new BN(totalYAmount),
+      totalXAmount: new BN(xAmount),
+      totalYAmount: new BN(yAmount),
       strategy: {
         maxBinId,
         minBinId,
         strategyType: StrategyType.Spot
       }
     });
-    const serializedTx = tx.serialize();
-    return VersionedTransaction.deserialize(serializedTx);
+
+    return {
+      transaction: Array.isArray(tx) ? tx[0] : tx,
+      positionKeypair
+    };
   }
 
-  /**
-   * 创建单边仓位
-   * @param {DLMM} dlmmPool - DLMM池实例
-   * @param {string} userPubkey - 用户公钥
-   * @param {number} totalXAmount - X代币数量
-   * @param {number} rangeInterval - 区间范围
-   * @returns {Promise<Object>} 交易结果
-   */
-  async createOneSidePosition(
-    dlmmPool: InstanceType<typeof DLMM>,
-    userPubkey: string,
-    totalXAmount: number,
-    rangeInterval = 10
-  ): Promise<VersionedTransaction> {
+  async createOneSidePosition(userPubkey: string, amount: number) {
+    const dlmmPool = await this.initDLMMPool();
     const activeBin = await dlmmPool.getActiveBin();
     const minBinId = activeBin.binId;
-    const maxBinId = activeBin.binId + rangeInterval * 2;
+    const maxBinId = activeBin.binId + 20;
+
+    const positionKeypair = Keypair.generate();
 
     const tx = await dlmmPool.initializePositionAndAddLiquidityByStrategy({
-      positionPubKey: new PublicKey(userPubkey), // 使用用户钱包地址作为仓位地址
+      positionPubKey: positionKeypair.publicKey,
       user: new PublicKey(userPubkey),
-      totalXAmount: new BN(totalXAmount),
+      totalXAmount: new BN(amount),
       totalYAmount: new BN(0),
       strategy: {
         maxBinId,
@@ -171,8 +126,70 @@ class MeteoraService {
         strategyType: StrategyType.Spot
       }
     });
-    const serializedTx = tx.serialize();
-    return VersionedTransaction.deserialize(serializedTx);
+
+    return {
+      transaction: Array.isArray(tx) ? tx[0] : tx,
+      positionKeypair
+    };
+  }
+
+  // 其他DLMM操作函数...
+  async removeLiquidity(positionPubKey: PublicKey, userPubkey: string, bps: number = 10000) {
+    const dlmmPool = await this.initDLMMPool();
+    const txs = await dlmmPool.removeLiquidity({
+      position: positionPubKey,
+      user: new PublicKey(userPubkey),
+      fromBinId: 0,
+      toBinId: 100,
+      bps: new BN(bps),
+      shouldClaimAndClose: bps === 10000
+    });
+    return Array.isArray(txs) ? txs : [txs];
+  }
+
+  async addLiquidity(positionPubKey: PublicKey, userPubkey: string, xAmount: number, yAmount: number) {
+    const dlmmPool = await this.initDLMMPool();
+    const activeBin = await dlmmPool.getActiveBin();
+    return await dlmmPool.addLiquidityByStrategy({
+      positionPubKey,
+      user: new PublicKey(userPubkey),
+      totalXAmount: new BN(xAmount * 10**6),
+      totalYAmount: new BN(yAmount * 10**6),
+      strategy: {
+        maxBinId: activeBin.binId + 10,
+        minBinId: activeBin.binId - 10,
+        strategyType: StrategyType.Spot
+      }
+    });
+  }
+
+  async closePosition(positionPubKey: PublicKey, userPubkey: string) {
+    const dlmmPool = await this.initDLMMPool();
+    const { userPositions } = await dlmmPool.getPositionsByUserAndLbPair(new PublicKey(userPubkey));
+    const position = userPositions.find(pos => pos.publicKey.equals(positionPubKey));
+    
+    if (!position) throw new Error('未找到指定仓位');
+
+    const binIds = position.positionData.positionBinData.map(bin => bin.binId);
+    const fromBinId = Math.min(...binIds);
+    const toBinId = Math.max(...binIds);
+
+    const txs = await dlmmPool.removeLiquidity({
+      position: positionPubKey,
+      user: new PublicKey(userPubkey),
+      fromBinId,
+      toBinId,
+      bps: new BN(10000),
+      shouldClaimAndClose: true
+    });
+
+    return Array.isArray(txs) ? txs : [txs];
+  }
+
+  async getActiveBin() {
+    const dlmmPool = await this.initDLMMPool();
+    const activeBin = await dlmmPool.getActiveBin();
+    return activeBin;
   }
 }
 
