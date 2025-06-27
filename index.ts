@@ -3,7 +3,7 @@ dotenv.config();
 import express from 'express';
 import TelegramBot from 'node-telegram-bot-api';
 import { PrivyClient } from '@privy-io/server-auth';
-import { PublicKey, VersionedTransaction, TransactionMessage, SystemProgram, LAMPORTS_PER_SOL, Keypair } from '@solana/web3.js';
+import { PublicKey, VersionedTransaction, TransactionMessage, SystemProgram, LAMPORTS_PER_SOL, Keypair, Cluster, Transaction } from '@solana/web3.js';
 import { getAssociatedTokenAddress, createTransferInstruction } from '@solana/spl-token';
 import { getAllUserWallets, saveUserWallet } from './mockDb';
 import { getJupiterUltraOrder, executeJupiterUltraOrder, getJupiterUltraBalances, SOL_MINT } from './jupiter';
@@ -13,7 +13,7 @@ import { BN } from 'bn.js';
 
 // Initialize services
 const solana = new SolanaService();
-const meteora = new MeteoraService(solana.connection);
+// MeteoraService will be initialized with user-provided pool address when needed
 
 const app = express();
 const port = process.env.PORT || 3003;
@@ -119,16 +119,23 @@ bot.onText(/\/start/, async (msg: TelegramBot.Message) => {
       msg.chat.id,
       `👋 Welcome to the Solana Trading Bot!\n\n` +
       `Your wallet address is: ${walletAddress}\n\n` +
-      `You can use the following commands:\n` +
-      `/getwallet - View your wallet balance\n` +
-      `/swap <token_address> <amount> - Swap SOL for another token\n` +
-      `/balance - Check your SOL balance\n` +
-      `/transactions - View your recent transactions\n` +
-      `/transfer <address> <amount> - Transfer SOL to another address\n` +
-      `/transfertoken <address> <token_mint> <amount> - Transfer tokens to another address\n` +
-      `/createposition <pool_address> <type> <amount> - Create position (balance/imbalance/one-side)\n\n` +
-      `Example: /swap EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 0.1\n` +
-      `Example: /transfertoken <address> EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 10`
+      `📌 Position Management Commands:\n` +
+      `/createposition <pool> <type> <amount> - Create new position (balance/imbalance/one-side)\n` +
+      `/listpositions <pool> - List your positions in a pool\n` +
+      `/addliquidity <position> <x_amount> <y_amount> - Add liquidity to position\n` +
+      `/removeliquidity <position> <percentage> - Remove liquidity from position\n` +
+      `/closeposition <position> - Close position completely\n` +
+      `/claimfees <position> - Claim accumulated fees\n\n` +
+      `📊 Pool Information Commands:\n` +
+      `/getactivebin <pool> - Get current active bin info\n` +
+      `/getpoolstatus <pool> - Get pool token status\n` +
+      `/getbinpricedetails <pool> - Get bin price details\n\n` +
+      `💱 Trading Commands:\n` +
+      `/swap <token_in> <token_out> <amount> - Swap tokens\n` +
+      `/getwallet - View all token balances\n\n` +
+      `Example:\n` +
+      `/createposition NPLipchco8sZA4jSR47dVafy77PdbpBCfqPf8Ksvsvj balance 100\n` +
+      `/listpositions NPLipchco8sZA4jSR47dVafy77PdbpBCfqPf8Ksvsvj`
     );
     } catch (error: unknown) {
       console.error(`Error fetching wallet for user ${userId}:`, error);
@@ -659,40 +666,149 @@ bot.onText(/\/createposition (.+) (.+) (.+)/, async (msg: TelegramBot.Message, m
       const wallet = await privy.walletApi.getWallet({id: walletId});
       const walletAddress = wallet.address;
 
-      // Validate pool address or use default test pool
-      const validPoolAddress = poolAddress || 'ARwi1S4DaiTG5DX7S4M4ZsrXqpMD1MrTmbu9ue2tpmEq';
+      if (!poolAddress) {
+        return bot.sendMessage(msg.chat.id, '❌ Pool address is required');
+      }
       
-      // Create position
-      const dlmmPool = await meteora.createDlmmPool(validPoolAddress);
+      const network = process.env.NETWORK as Cluster || 'devnet';
+      const meteoraService = new MeteoraService(solana.connection, poolAddress, network);
       const amountInLamports = Math.floor(amount * 1e9);
 
-    let transaction: VersionedTransaction | undefined;
-    switch (positionType) {
-      case 'balance':
-        transaction = await meteora.createBalancePosition(dlmmPool, walletAddress, amountInLamports);
-        break;
-      case 'imbalance':
-        transaction = await meteora.createImbalancePosition(dlmmPool, walletAddress, amountInLamports, amountInLamports/2);
-        break;
-      case 'one-side':
-        transaction = await meteora.createOneSidePosition(dlmmPool, walletAddress, amountInLamports);
-        break;
-      default:
-        throw new Error('Invalid position type');
-    }
+      let signature: string;
+      
+      switch (positionType) {
+        case 'balance':
+          // Generate position keypair
+          const positionKeypair = Keypair.generate();
+          
+          // Create position with keypair
+          const {transaction: balanceTx, positionKeypair: balanceKeypair} = await meteoraService.createBalancePosition(
+            walletAddress, 
+            amountInLamports,
+            positionKeypair
+          );
 
-    if (!transaction) {
-      throw new Error('Failed to create transaction');
-    }
-    const { signedTransaction } = await privy.walletApi.solana.signTransaction({
-      walletId,
-      transaction
-    });
+          // Log transaction construction
+          console.log('✅ Transaction constructed');
 
-    const signature = await solana.connection.sendRawTransaction(signedTransaction.serialize(), {
-      skipPreflight: false,
-      preflightCommitment: 'confirmed'
-    });
+          const transaction = Array.isArray(balanceTx) ? balanceTx[0] : balanceTx;
+          console.log('📦 Transaction type:', transaction.constructor.name);
+
+          // Get latest blockhash
+          const { blockhash } = await solana.connection.getLatestBlockhash('finalized');
+
+          let finalTransaction;
+
+          if (transaction instanceof VersionedTransaction) {
+            // Handle VersionedTransaction
+            const instructions = transaction.message.staticAccountKeys.map((_, idx) => {
+              const ix = transaction.message.compiledInstructions[idx];
+              return {
+                programIdIndex: ix.programIdIndex,
+                accountKeyIndexes: ix.accountKeyIndexes,
+                data: ix.data
+              };
+            });
+
+            const messageV0 = new TransactionMessage({
+              payerKey: new PublicKey(walletAddress),
+              recentBlockhash: blockhash,
+              instructions: instructions.map(ix => {
+                const programId = transaction.message.staticAccountKeys[ix.programIdIndex];
+                const accounts = ix.accountKeyIndexes.map(i => ({
+                  pubkey: transaction.message.staticAccountKeys[i],
+                  isSigner: false,
+                  isWritable: true
+                }));
+                return {
+                  programId,
+                  keys: accounts,
+                  data: Buffer.from(ix.data)
+                };
+              })
+            }).compileToV0Message();
+
+            finalTransaction = new VersionedTransaction(messageV0);
+            finalTransaction.sign([balanceKeypair]);
+
+          } else if (transaction instanceof Transaction) {
+            // Handle legacy Transaction
+            transaction.recentBlockhash = blockhash;
+            transaction.feePayer ||= new PublicKey(walletAddress);
+            transaction.partialSign(balanceKeypair);
+
+            finalTransaction = transaction;
+
+          } else if (typeof transaction === 'string') {
+            throw new Error('Transaction already serialized to base64 by Meteora SDK');
+          } else {
+            throw new Error('Unknown transaction type');
+          }
+
+          // Sign with Privy
+          const { signedTransaction } = await privy.walletApi.solana.signTransaction({
+            walletId,
+            transaction: finalTransaction
+          });
+
+          // Add position keypair signature
+          const signedTx = VersionedTransaction.deserialize(signedTransaction.serialize());
+          signedTx.sign([balanceKeypair]);
+
+          // Send transaction
+          signature = await solana.connection.sendRawTransaction(signedTx.serialize(), {
+            skipPreflight: false,
+            preflightCommitment: 'confirmed'
+          });
+
+          console.log('🎉 Position created! Transaction:', signature);
+          break;
+
+        case 'imbalance':
+          // 获取交易和仓位Keypair
+          const {transaction: imbalanceTx, positionKeypair: imbalanceKeypair} = await meteoraService.createImbalancePosition(walletAddress, amountInLamports, amountInLamports/2);
+          
+          // 使用privy API签名交易
+          const { signedTransaction: imbalanceSignedTx } = await privy.walletApi.solana.signTransaction({
+            walletId,
+            transaction: imbalanceTx
+          });
+          
+          // 手动添加仓位Keypair的签名
+          const signedImbalanceTx = VersionedTransaction.deserialize(imbalanceSignedTx.serialize());
+          signedImbalanceTx.sign([imbalanceKeypair]);
+          
+          // 发送已签名的交易
+          signature = await solana.connection.sendRawTransaction(signedImbalanceTx.serialize(), {
+            skipPreflight: false,
+            preflightCommitment: 'confirmed'
+          });
+          break;
+
+        case 'one-side':
+          // 获取交易和仓位Keypair
+          const {transaction: oneSideTx, positionKeypair: oneSideKeypair} = await meteoraService.createOneSidePosition(walletAddress, amountInLamports);
+          
+          // 使用privy API签名交易
+          const { signedTransaction: oneSideSignedTx } = await privy.walletApi.solana.signTransaction({
+            walletId,
+            transaction: oneSideTx
+          });
+          
+          // 手动添加仓位Keypair的签名
+          const signedOneSideTx = VersionedTransaction.deserialize(oneSideSignedTx.serialize());
+          signedOneSideTx.sign([oneSideKeypair]);
+          
+          // 发送已签名的交易
+          signature = await solana.connection.sendRawTransaction(signedOneSideTx.serialize(), {
+            skipPreflight: false,
+            preflightCommitment: 'confirmed'
+          });
+          break;
+
+        default:
+          throw new Error('Invalid position type');
+      }
     
     bot.sendMessage(
       msg.chat.id,
@@ -721,6 +837,87 @@ bot.onText(/^\/createposition$/, (msg) => {
     'Example:\n' +
     '/createposition balance NPLipchco8sZA4jSR47dVafy77PdbpBCfqPf8Ksvsvj 100\n\n' +
     'Available types: balance, imbalance, one-side'
+  );
+});
+
+// List positions command
+bot.onText(/\/listpositions (.+)/, async (msg: TelegramBot.Message, match: RegExpExecArray | null) => {
+  if (!msg.from || !match) {
+    return;
+  }
+  const userId = msg.from.id;
+  const poolAddress = match[1];
+
+  // Validate pool address
+  try {
+    new PublicKey(poolAddress);
+  } catch (error) {
+    return bot.sendMessage(msg.chat.id, '❌ Invalid pool address');
+  }
+
+  const userWallets = getAllUserWallets();
+  if (!userWallets[userId]) {
+    return bot.sendMessage(msg.chat.id, '❌ Please use /start to create a wallet first');
+  }
+
+  try {
+    const walletId = userWallets[userId];
+    const wallet = await privy.walletApi.getWallet({id: walletId});
+    const network = process.env.NETWORK as Cluster || 'devnet';
+    const meteoraService = new MeteoraService(solana.connection, poolAddress, network);
+
+    const positions = await meteoraService.listPositions(wallet.address);
+    
+    if (positions.length === 0) {
+      return bot.sendMessage(msg.chat.id, 'ℹ️ No positions found in this pool');
+    }
+
+    // console.log(positions)
+
+    let message = '📊 Your Positions:\n\n';
+    positions.forEach((pos, i) => {
+      message += `📍 Position ${i + 1}: ${pos.publicKey.toString()}\n\n`;
+      
+      // Basic Info
+      message += 'Basic Info:\n';
+      message += '----------------\n';
+      message += `Bin Range:    ${pos.positionData.lowerBinId}-${pos.positionData.upperBinId}\n`;
+      message += `Last Updated: ${new Date(pos.positionData.lastUpdatedAt.toNumber() * 1000).toLocaleString()}\n`;
+      message += `Owner:        ${pos.positionData.owner.toString().slice(0, 8)}...${pos.positionData.owner.toString().slice(-8)}\n\n`;
+      
+      // Amounts
+      message += 'Amounts:\n';
+      message += '----------------\n';
+      message += `Total X: ${pos.positionData.totalXAmount.toString().padEnd(20)}`;
+      message += `Excl. Fee X: ${pos.positionData.totalXAmountExcludeTransferFee.toString()}\n`;
+      message += `Total Y: ${pos.positionData.totalYAmount.toString().padEnd(20)}`;
+      message += `Excl. Fee Y: ${pos.positionData.totalYAmountExcludeTransferFee.toString()}\n\n`;
+      
+      // Fees & Rewards
+      message += 'Fees & Rewards:\n';
+      message += '----------------\n';
+      message += `Fee X:      ${pos.positionData.feeX.toString().padEnd(15)}`;
+      message += `Reward One: ${pos.positionData.rewardOne.toString()}\n`;
+      message += `Fee Y:      ${pos.positionData.feeY.toString().padEnd(15)}`;
+      message += `Reward Two: ${pos.positionData.rewardTwo.toString()}\n\n`;
+    });
+
+    bot.sendMessage(msg.chat.id, message);
+  } catch (error: unknown) {
+    console.error('List positions error:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    bot.sendMessage(msg.chat.id, `❌ Error listing positions: ${errorMessage}`);
+  }
+});
+
+// Help for listpositions
+bot.onText(/^\/listpositions$/, (msg) => {
+  bot.sendMessage(
+    msg.chat.id,
+    '❌ Missing parameters. Usage:\n' +
+    '/listpositions <pool_address>\n\n' +
+    'Example:\n' +
+    '/listpositions NPLipchco8sZA4jSR47dVafy77PdbpBCfqPf8Ksvsvj'
   );
 });
 
@@ -795,6 +992,167 @@ bot.onText(/\/transfer (.+) (.+)/, async (msg: TelegramBot.Message, match: RegEx
         `❌ Sorry, there was an error processing your transfer: ${errorMessage}. Please try again later.`
       );
     }
+});
+
+// Add liquidity command
+bot.onText(/\/addliquidity (.+) (.+) (.+)/, async (msg: TelegramBot.Message, match: RegExpExecArray | null) => {
+  if (!msg.from || !match) {
+    return;
+  }
+  const userId = msg.from.id;
+  const positionPubKey = match[1];
+  const xAmount = parseFloat(match[2]);
+  const yAmount = parseFloat(match[3]);
+
+  // Validate parameters
+  if (isNaN(xAmount) || xAmount <= 0 || isNaN(yAmount) || yAmount <= 0) {
+    return bot.sendMessage(msg.chat.id, '❌ Invalid amounts, must be numbers > 0');
+  }
+
+  // Get user wallet
+  const userWallets = getAllUserWallets();
+  if (!userWallets[userId]) {
+    return bot.sendMessage(msg.chat.id, '❌ Please use /start to create a wallet first');
+  }
+
+  try {
+    const walletId = userWallets[userId];
+    const wallet = await privy.walletApi.getWallet({id: walletId});
+    const network = process.env.NETWORK as Cluster || 'devnet';
+    
+    // Get position to determine pool address
+    const position = await solana.connection.getAccountInfo(new PublicKey(positionPubKey));
+    if (!position) {
+      return bot.sendMessage(msg.chat.id, '❌ Position not found');
+    }
+
+    // Create Meteora service
+    const meteoraService = new MeteoraService(solana.connection, positionPubKey, network);
+    
+    // Add liquidity
+    const tx = await meteoraService.addLiquidity(
+      new PublicKey(positionPubKey),
+      wallet.address,
+      xAmount,
+      yAmount
+    );
+
+    // Sign transaction via Privy
+    const { signedTransaction } = await privy.walletApi.solana.signTransaction({
+      walletId,
+      transaction: tx
+    });
+
+    // Send transaction
+    const signature = await solana.connection.sendRawTransaction(signedTransaction.serialize());
+    
+    bot.sendMessage(
+      msg.chat.id,
+      `✅ Liquidity added successfully!\n\n` +
+      `Position: ${positionPubKey}\n` +
+      `X Amount: ${xAmount}\n` +
+      `Y Amount: ${yAmount}\n` +
+      `Transaction: https://solscan.io/tx/${signature}`
+    );
+  } catch (error: unknown) {
+    console.error('Add liquidity error:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    bot.sendMessage(
+      msg.chat.id,
+      `❌ Error adding liquidity: ${errorMessage}`
+    );
+  }
+});
+
+// Help for addliquidity
+bot.onText(/^\/addliquidity$/, (msg) => {
+  bot.sendMessage(
+    msg.chat.id,
+    '❌ Missing parameters. Usage:\n' +
+    '/addliquidity <position_pubkey> <x_amount> <y_amount>\n\n' +
+    'Example:\n' +
+    '/addliquidity 3xZc... 100 50'
+  );
+});
+
+// Remove liquidity command
+bot.onText(/\/removeliquidity (.+) (.+)/, async (msg: TelegramBot.Message, match: RegExpExecArray | null) => {
+  if (!msg.from || !match) {
+    return;
+  }
+  const userId = msg.from.id;
+  const positionPubKey = match[1];
+  const bps = parseFloat(match[2]);
+
+  // Validate parameters
+  if (isNaN(bps)) {
+    return bot.sendMessage(msg.chat.id, '❌ Invalid percentage, must be number between 1-100');
+  }
+
+  // Get user wallet
+  const userWallets = getAllUserWallets();
+  if (!userWallets[userId]) {
+    return bot.sendMessage(msg.chat.id, '❌ Please use /start to create a wallet first');
+  }
+
+  try {
+    const walletId = userWallets[userId];
+    const wallet = await privy.walletApi.getWallet({id: walletId});
+    const network = process.env.NETWORK as Cluster || 'devnet';
+    
+    // Get position to determine pool address
+    const position = await solana.connection.getAccountInfo(new PublicKey(positionPubKey));
+    if (!position) {
+      return bot.sendMessage(msg.chat.id, '❌ Position not found');
+    }
+
+    // Create Meteora service
+    const meteoraService = new MeteoraService(solana.connection, positionPubKey, network);
+    
+    // Remove liquidity
+    const txs = await meteoraService.removeLiquidity(
+      new PublicKey(positionPubKey),
+      wallet.address,
+      bps * 100 // Convert percentage to basis points
+    );
+
+    // Sign transactions via Privy
+    const signatures = [];
+    for (const tx of txs) {
+      const { signedTransaction } = await privy.walletApi.solana.signTransaction({
+        walletId,
+        transaction: tx
+      });
+      const signature = await solana.connection.sendRawTransaction(signedTransaction.serialize());
+      signatures.push(signature);
+    }
+    
+    bot.sendMessage(
+      msg.chat.id,
+      `✅ Liquidity removed successfully!\n\n` +
+      `Position: ${positionPubKey}\n` +
+      `Percentage: ${bps}%\n` +
+      `Transactions:\n${signatures.map(s => `https://solscan.io/tx/${s}`).join('\n')}`
+    );
+  } catch (error: unknown) {
+    console.error('Remove liquidity error:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    bot.sendMessage(
+      msg.chat.id,
+      `❌ Error removing liquidity: ${errorMessage}`
+    );
+  }
+});
+
+// Help for removeliquidity
+bot.onText(/^\/removeliquidity$/, (msg) => {
+  bot.sendMessage(
+    msg.chat.id,
+    '❌ Missing parameters. Usage:\n' +
+    '/removeliquidity <position_pubkey> <percentage>\n\n' +
+    'Example:\n' +
+    '/removeliquidity 3xZc... 50'
+  );
 });
 
 // Start the server
