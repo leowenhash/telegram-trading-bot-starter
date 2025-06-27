@@ -120,22 +120,19 @@ bot.onText(/\/start/, async (msg: TelegramBot.Message) => {
       `👋 Welcome to the Solana Trading Bot!\n\n` +
       `Your wallet address is: ${walletAddress}\n\n` +
       `📌 Position Management Commands:\n` +
-      `/createposition <pool> <type> <amount> - Create new position (balance/imbalance/one-side)\n` +
-      `/listpositions <pool> - List your positions in a pool\n` +
-      `/addliquidity <position> <x_amount> <y_amount> - Add liquidity to position\n` +
-      `/removeliquidity <position> <percentage> - Remove liquidity from position\n` +
-      `/closeposition <position> - Close position completely\n` +
-      `/claimfees <position> - Claim accumulated fees\n\n` +
-      `📊 Pool Information Commands:\n` +
-      `/getactivebin <pool> - Get current active bin info\n` +
-      `/getpoolstatus <pool> - Get pool token status\n` +
-      `/getbinpricedetails <pool> - Get bin price details\n\n` +
+      `/createposition <type> <pool> <amount> - Create new position (balance/imbalance/one-side)\n` +
+      `/listpositions <pool> - List positions in a pool\n` +
+      `/closeposition <pool> - Close a position (will show list to select)\n\n` +
       `💱 Trading Commands:\n` +
-      `/swap <token_in> <token_out> <amount> - Swap tokens\n` +
-      `/getwallet - View all token balances\n\n` +
+      `/swap <token_address> <amount> - Swap SOL for token\n` +
+      `/getwallet - View all token balances\n` +
+      `/balance - View SOL balance\n` +
+      `/transactions - View recent transactions\n` +
+      `/transfer <address> <amount> - Transfer SOL\n` +
+      `/transfertoken <address> <token> <amount> - Transfer tokens\n\n` +
       `Example:\n` +
-      `/createposition NPLipchco8sZA4jSR47dVafy77PdbpBCfqPf8Ksvsvj balance 100\n` +
-      `/listpositions NPLipchco8sZA4jSR47dVafy77PdbpBCfqPf8Ksvsvj`
+      `/createposition balance NPLipchco8sZA4jSR47dVafy77PdbpBCfqPf8Ksvsvj 100\n` +
+      `/swap EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 0.1`
     );
     } catch (error: unknown) {
       console.error(`Error fetching wallet for user ${userId}:`, error);
@@ -994,22 +991,23 @@ bot.onText(/\/transfer (.+) (.+)/, async (msg: TelegramBot.Message, match: RegEx
     }
 });
 
-// Add liquidity command
-bot.onText(/\/addliquidity (.+) (.+) (.+)/, async (msg: TelegramBot.Message, match: RegExpExecArray | null) => {
+// Close position command
+bot.onText(/\/closeposition (.+)/, async (msg: TelegramBot.Message, match: RegExpExecArray | null) => {
   if (!msg.from || !match) {
     return;
   }
   const userId = msg.from.id;
-  const positionPubKey = match[1];
-  const xAmount = parseFloat(match[2]);
-  const yAmount = parseFloat(match[3]);
+  const poolAddress = match[1];
 
-  // Validate parameters
-  if (isNaN(xAmount) || xAmount <= 0 || isNaN(yAmount) || yAmount <= 0) {
-    return bot.sendMessage(msg.chat.id, '❌ Invalid amounts, must be numbers > 0');
+  console.log(`Processing /closeposition command for user ${userId} for pool ${poolAddress}`);
+
+  // Validate pool address
+  try {
+    new PublicKey(poolAddress);
+  } catch (error) {
+    return bot.sendMessage(msg.chat.id, '❌ Invalid pool address');
   }
 
-  // Get user wallet
   const userWallets = getAllUserWallets();
   if (!userWallets[userId]) {
     return bot.sendMessage(msg.chat.id, '❌ Please use /start to create a wallet first');
@@ -1018,142 +1016,179 @@ bot.onText(/\/addliquidity (.+) (.+) (.+)/, async (msg: TelegramBot.Message, mat
   try {
     const walletId = userWallets[userId];
     const wallet = await privy.walletApi.getWallet({id: walletId});
-    const network = process.env.NETWORK as Cluster || 'devnet';
+    const walletAddress = wallet.address;
+
+    // Initialize service with pool address
+    const meteoraService = new MeteoraService(solana.connection, poolAddress, 'devnet');
+    const positions = await meteoraService.listPositions(walletAddress);
     
-    // Get position to determine pool address
-    const position = await solana.connection.getAccountInfo(new PublicKey(positionPubKey));
-    if (!position) {
-      return bot.sendMessage(msg.chat.id, '❌ Position not found');
+    if (positions.length === 0) {
+      return bot.sendMessage(msg.chat.id, 'ℹ️ No positions found');
     }
 
-    // Create Meteora service
-    const meteoraService = new MeteoraService(solana.connection, positionPubKey, network);
-    
-    // Add liquidity
-    const tx = await meteoraService.addLiquidity(
-      new PublicKey(positionPubKey),
-      wallet.address,
-      xAmount,
-      yAmount
+    // Create inline keyboard for position selection
+    const positionOptions = positions.map((pos: any) => ({
+      text: pos.publicKey.toString().slice(0, 8) + '...',
+      callback_data: `close_position_${pos.publicKey.toString()}`
+    }));
+
+    const options = {
+      reply_markup: {
+        inline_keyboard: [
+          ...positionOptions.map(opt => [opt]),
+          [{ text: '❌ Cancel', callback_data: 'cancel_close' }]
+        ]
+      }
+    };
+
+    bot.sendMessage(
+      msg.chat.id,
+      '📊 Select a position to close:',
+      options
     );
 
-    // Sign transaction via Privy
-    const { signedTransaction } = await privy.walletApi.solana.signTransaction({
-      walletId,
-      transaction: tx
+    // Handle position selection
+    bot.on('callback_query', async (query: TelegramBot.CallbackQuery) => {
+      try {
+        if (!query.data || !query.message) return;
+
+        if (query.data.startsWith('close_position_')) {
+          const positionPubKey = query.data.replace('close_position_', '');
+          
+          // First verify position still exists
+          const positions = await meteoraService.listPositions(walletAddress);
+          const position = positions.find((pos: any) => pos.publicKey.toString() === positionPubKey);
+          
+          if (!position) {
+            return bot.editMessageText(
+              '❌ Position not found or already closed',
+              {
+                chat_id: query.message.chat.id,
+                message_id: query.message.message_id
+              }
+            );
+          }
+
+          const txs = await meteoraService.closePosition(
+            new PublicKey(positionPubKey),
+            walletAddress
+          );
+
+          const signatures: string[] = [];
+          for (const tx of txs) {
+            try {
+              // Get latest blockhash
+              const { blockhash } = await solana.connection.getLatestBlockhash('finalized');
+              
+              // Update transaction with latest blockhash
+              if (tx instanceof VersionedTransaction) {
+                const message = tx.message;
+                const newMessage = new TransactionMessage({
+                  payerKey: message.staticAccountKeys[0],
+                  recentBlockhash: blockhash,
+                  instructions: message.compiledInstructions.map(ix => ({
+                    programId: message.staticAccountKeys[ix.programIdIndex],
+                    keys: ix.accountKeyIndexes.map(i => ({
+                      pubkey: message.staticAccountKeys[i],
+                      isSigner: false,
+                      isWritable: true
+                    })),
+                    data: Buffer.from(ix.data)
+                  }))
+                }).compileToV0Message();
+                
+                tx.message = newMessage;
+              } else if (tx instanceof Transaction) {
+                tx.recentBlockhash = blockhash;
+                tx.feePayer = new PublicKey(walletAddress);
+              }
+
+              // Sign transaction
+              const { signedTransaction } = await privy.walletApi.solana.signTransaction({
+                walletId,
+                transaction: tx
+              });
+
+              // Send transaction
+              const signature = await solana.connection.sendRawTransaction(
+                signedTransaction.serialize(),
+                {
+                  skipPreflight: false,
+                  preflightCommitment: 'confirmed'
+                }
+              );
+              
+              // Confirm transaction
+              await solana.connection.confirmTransaction({
+                signature,
+                blockhash,
+                lastValidBlockHeight: (await solana.connection.getBlockHeight()) + 150
+              });
+
+              signatures.push(signature);
+            } catch (error: unknown) {
+              console.error('Transaction error:', error);
+              let errorMessage = 'Unknown error';
+              if (error instanceof Error) {
+                errorMessage = error.message;
+                // Handle specific Meteora error codes
+                if (error.message.includes('3007')) {
+                  errorMessage = 'Position already closed or does not exist';
+                }
+              }
+              bot.editMessageText(
+                `❌ Transaction failed: ${errorMessage}`,
+                {
+                  chat_id: query.message.chat.id,
+                  message_id: query.message.message_id
+                }
+              );
+              return;
+            }
+          }
+        
+          bot.editMessageText(
+            `✅ Position closed successfully!\n\n` +
+            `Position: ${positionPubKey}\n` +
+            `Transactions:\n${signatures.map(s => `https://solscan.io/tx/${s}`).join('\n')}`,
+            {
+              chat_id: query.message.chat.id,
+              message_id: query.message.message_id
+            }
+          );
+        } else if (query.data === 'cancel_close') {
+          bot.editMessageText(
+            '❌ Position close cancelled',
+            {
+              chat_id: query.message.chat.id,
+              message_id: query.message.message_id
+            }
+          );
+        }
+      } catch (error: unknown) {
+        console.error('Callback query error:', error);
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        if (query.message) {
+          bot.editMessageText(
+            `❌ Error processing request: ${errorMessage}`,
+            {
+              chat_id: query.message.chat.id,
+              message_id: query.message.message_id
+            }
+          );
+        } else {
+          console.error('Cannot send error message - query.message is undefined');
+        }
+      }
     });
-
-    // Send transaction
-    const signature = await solana.connection.sendRawTransaction(signedTransaction.serialize());
-    
-    bot.sendMessage(
-      msg.chat.id,
-      `✅ Liquidity added successfully!\n\n` +
-      `Position: ${positionPubKey}\n` +
-      `X Amount: ${xAmount}\n` +
-      `Y Amount: ${yAmount}\n` +
-      `Transaction: https://solscan.io/tx/${signature}`
-    );
   } catch (error: unknown) {
-    console.error('Add liquidity error:', error);
+    console.error('List positions error:', error);
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    bot.sendMessage(
-      msg.chat.id,
-      `❌ Error adding liquidity: ${errorMessage}`
-    );
+    bot.sendMessage(msg.chat.id, `❌ Error listing positions: ${errorMessage}`);
   }
 });
 
-// Help for addliquidity
-bot.onText(/^\/addliquidity$/, (msg) => {
-  bot.sendMessage(
-    msg.chat.id,
-    '❌ Missing parameters. Usage:\n' +
-    '/addliquidity <position_pubkey> <x_amount> <y_amount>\n\n' +
-    'Example:\n' +
-    '/addliquidity 3xZc... 100 50'
-  );
-});
 
-// Remove liquidity command
-bot.onText(/\/removeliquidity (.+) (.+)/, async (msg: TelegramBot.Message, match: RegExpExecArray | null) => {
-  if (!msg.from || !match) {
-    return;
-  }
-  const userId = msg.from.id;
-  const positionPubKey = match[1];
-  const bps = parseFloat(match[2]);
-
-  // Validate parameters
-  if (isNaN(bps)) {
-    return bot.sendMessage(msg.chat.id, '❌ Invalid percentage, must be number between 1-100');
-  }
-
-  // Get user wallet
-  const userWallets = getAllUserWallets();
-  if (!userWallets[userId]) {
-    return bot.sendMessage(msg.chat.id, '❌ Please use /start to create a wallet first');
-  }
-
-  try {
-    const walletId = userWallets[userId];
-    const wallet = await privy.walletApi.getWallet({id: walletId});
-    const network = process.env.NETWORK as Cluster || 'devnet';
-    
-    // Get position to determine pool address
-    const position = await solana.connection.getAccountInfo(new PublicKey(positionPubKey));
-    if (!position) {
-      return bot.sendMessage(msg.chat.id, '❌ Position not found');
-    }
-
-    // Create Meteora service
-    const meteoraService = new MeteoraService(solana.connection, positionPubKey, network);
-    
-    // Remove liquidity
-    const txs = await meteoraService.removeLiquidity(
-      new PublicKey(positionPubKey),
-      wallet.address,
-      bps * 100 // Convert percentage to basis points
-    );
-
-    // Sign transactions via Privy
-    const signatures = [];
-    for (const tx of txs) {
-      const { signedTransaction } = await privy.walletApi.solana.signTransaction({
-        walletId,
-        transaction: tx
-      });
-      const signature = await solana.connection.sendRawTransaction(signedTransaction.serialize());
-      signatures.push(signature);
-    }
-    
-    bot.sendMessage(
-      msg.chat.id,
-      `✅ Liquidity removed successfully!\n\n` +
-      `Position: ${positionPubKey}\n` +
-      `Percentage: ${bps}%\n` +
-      `Transactions:\n${signatures.map(s => `https://solscan.io/tx/${s}`).join('\n')}`
-    );
-  } catch (error: unknown) {
-    console.error('Remove liquidity error:', error);
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    bot.sendMessage(
-      msg.chat.id,
-      `❌ Error removing liquidity: ${errorMessage}`
-    );
-  }
-});
-
-// Help for removeliquidity
-bot.onText(/^\/removeliquidity$/, (msg) => {
-  bot.sendMessage(
-    msg.chat.id,
-    '❌ Missing parameters. Usage:\n' +
-    '/removeliquidity <position_pubkey> <percentage>\n\n' +
-    'Example:\n' +
-    '/removeliquidity 3xZc... 50'
-  );
-});
 
 // Start the server
 app.listen(port, () => {
